@@ -211,6 +211,7 @@ public:
   /// State management
   ///
   virtual void reset();
+  virtual void insert(MCFragment *F) = 0;
 
   MCContext &getContext() const { return Context; }
 
@@ -751,8 +752,10 @@ public:
 
   /// \brief Streamer specific finalization.
   virtual unsigned int FinishImpl();
+  virtual unsigned int FinishImpl(std::vector<int> &size_of_instructions);
   /// \brief Finish emission of machine code.
   unsigned int Finish();
+  unsigned int Finish(std::vector<int> &size_of_instructions);
 
   virtual bool mayHaveInstructions(MCSection &Sec) const { return true; }
 };

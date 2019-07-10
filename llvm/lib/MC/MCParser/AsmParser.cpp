@@ -136,6 +136,7 @@ private:
 
   AsmCond TheCondState;
   std::vector<AsmCond> TheCondStack;
+  std::vector<int>size_of_instructions;
 
   /// \brief maps directive names to handler methods in parser
   /// extensions. Extensions register themselves in this map by calling
@@ -191,7 +192,7 @@ public:
             const MCAsmInfo &MAI);
   ~AsmParser() override;
 
-  size_t Run(bool NoInitialTextSection, uint64_t Address, bool NoFinalize = false) override;
+  size_t Run(bool NoInitialTextSection, uint64_t Address, bool is_ppc = false) override;
 
   void addDirectiveHandler(StringRef Directive,
                            ExtensionDirectiveHandler Handler) override {
@@ -210,6 +211,9 @@ public:
   MCAsmLexer &getLexer() override { return Lexer; }
   MCContext &getContext() override { return Ctx; }
   MCStreamer &getStreamer() override { return Out; }
+  std::vector<int> get_instruction_sizes() override {
+    return size_of_instructions;
+  }
   unsigned getAssemblerDialect() override {
     if (AssemblerDialect == ~0U)
       return MAI.getAssemblerDialect();
@@ -266,6 +270,8 @@ private:
 
   bool parseStatement(ParseStatementInfo &Info,
                       MCAsmParserSemaCallback *SI, uint64_t &Address);
+  bool parseStatement(ParseStatementInfo &Info,
+                      MCAsmParserSemaCallback *SI, uint64_t &Address, bool is_ppc);
   void eatToEndOfLine();
   bool parseCppHashLineFilenameComment(SMLoc L);
 
@@ -667,7 +673,29 @@ const AsmToken &AsmParser::Lex() {
   return *tok;
 }
 
-size_t AsmParser::Run(bool NoInitialTextSection, uint64_t Address, bool NoFinalize)
+//Basically does the same thing as python's split() but with -1 only and puts everything back in one vector
+void process_split_sizes(std::vector<int> &size_of_instructions)
+{
+  bool is_last_one = false;
+  std::vector<int>new_size_of_instructions;
+
+  //An edge case when the start is empty
+  if (size_of_instructions[0] == -1)new_size_of_instructions.push_back(0);
+
+  for(auto size: size_of_instructions){
+    if (size == -1){
+      if (is_last_one)new_size_of_instructions.push_back(0);
+      else is_last_one = true;
+    }
+    else{
+      is_last_one = false;
+      new_size_of_instructions.push_back(size);
+    }
+  }
+  size_of_instructions = new_size_of_instructions;
+}
+
+size_t AsmParser::Run(bool NoInitialTextSection, uint64_t Address, bool is_ppc) //rename nofinalize to is_pcc cuz it's the easiest and doesn't break anything
 {
   // count number of statement
   size_t count = 0;
@@ -702,15 +730,18 @@ size_t AsmParser::Run(bool NoInitialTextSection, uint64_t Address, bool NoFinali
         0, StringRef(), getContext().getMainFileName()));
   }
 
-  // While we have input, parse each statement.
   while (Lexer.isNot(AsmToken::Eof)) {
     ParseStatementInfo Info;
-    if (!parseStatement(Info, nullptr, Address)) {
+    //My hack here
+    //Add a dummy fragment after parsing each instruction into a seprate fragment
+    //And then use the dummy fragments as a way to split the instructions written into the stream 
+    if (!parseStatement(Info, nullptr, Address, is_ppc)) {
+      MCDummyFragment *dummy_fragment = new MCDummyFragment(nullptr);
+      getStreamer().insert(dummy_fragment);
       count++;
       continue;
     }
 
-    //printf(">> 222 error = %u\n", Info.KsError);
     if (!KsError)
         KsError = Info.KsError;
         return 0;
@@ -720,7 +751,7 @@ size_t AsmParser::Run(bool NoInitialTextSection, uint64_t Address, bool NoFinali
     // assert(HadError && "Parse statement returned an error, but none emitted!");
 
     //eatToEndOfStatement();
-  }
+}  
 
   if (TheCondState.TheCond != StartingCondState.TheCond ||
       TheCondState.Ignore != StartingCondState.Ignore) {
@@ -733,7 +764,7 @@ size_t AsmParser::Run(bool NoInitialTextSection, uint64_t Address, bool NoFinali
   // Targets that don't do subsections via symbols may not want this, though,
   // so conservatively exclude them. Only do this if we're finalizing, though,
   // as otherwise we won't necessarilly have seen everything yet.
-  if (!NoFinalize && MAI.hasSubsectionsViaSymbols()) {
+  if (MAI.hasSubsectionsViaSymbols()) {
     for (const auto &TableEntry : getContext().getSymbols()) {
       MCSymbol *Sym = TableEntry.getValue();
       // Variable symbols may not be marked as defined, so check those
@@ -754,13 +785,17 @@ size_t AsmParser::Run(bool NoInitialTextSection, uint64_t Address, bool NoFinali
   // Finalize the output stream if there are no errors and if the client wants
   // us to.
   if (!KsError) {
-      if (!HadError && !NoFinalize)
-          KsError = Out.Finish();
+      if (!HadError)
+          KsError = Out.Finish(size_of_instructions);
   } else
-      Out.Finish();
+      Out.Finish(size_of_instructions);
 
   //return HadError || getContext().hadError();
-  return count;
+  if(!KsError){
+    process_split_sizes(size_of_instructions);
+    return count;
+  }
+  return 0;
 }
 
 void AsmParser::checkForValidSection()
@@ -1438,9 +1473,534 @@ bool AsmParser::isDirective(StringRef IDVal)
 ///   ::= EndOfStatement
 ///   ::= Label* Directive ...Operands... EndOfStatement
 ///   ::= Label* Identifier OperandList* EndOfStatement
-// return true on error
 bool AsmParser::parseStatement(ParseStatementInfo &Info,
                                MCAsmParserSemaCallback *SI, uint64_t &Address)
+{
+  KsError = 0;
+  if (Lexer.is(AsmToken::EndOfStatement)) {
+    Out.AddBlankLine();
+    Lex();
+    return false; //to make sure fake L's don't get added
+  }
+
+  // Statements always start with an identifier or are a full line comment.
+  AsmToken ID = getTok();
+  //printf(">>> parseStatement:ID = %s\n", ID.getString().str().c_str());
+  SMLoc IDLoc = ID.getLoc();
+  StringRef IDVal;
+  int64_t LocalLabelVal = -1;
+  // A full line comment is a '#' as the first token.
+  if (Lexer.is(AsmToken::Hash))
+    return parseCppHashLineFilenameComment(IDLoc);
+
+  // Allow an integer followed by a ':' as a directional local label.
+  if (Lexer.is(AsmToken::Integer)) {
+    bool valid;
+    LocalLabelVal = getTok().getIntVal(valid);
+    if (!valid) {
+        return true;
+    }
+    if (LocalLabelVal < 0) {
+      if (!TheCondState.Ignore) {
+        // return TokError("unexpected token at start of statement");
+        Info.KsError = KS_ERR_ASM_STAT_TOKEN;
+        return true;
+      }
+      IDVal = "";
+    } else {
+      IDVal = getTok().getString();
+      Lex(); // Consume the integer token to be used as an identifier token.
+      if (Lexer.getKind() != AsmToken::Colon) {
+        if (!TheCondState.Ignore) {
+          // return TokError("unexpected token at start of statement");
+          Info.KsError = KS_ERR_ASM_STAT_TOKEN;
+          return true;
+        }
+      }
+    }
+  } else if (Lexer.is(AsmToken::Dot)) {
+    // Treat '.' as a valid identifier in this context.
+    Lex();
+    IDVal = ".";
+  } else if (Lexer.is(AsmToken::LCurly)) {
+    // Treat '{' as a valid identifier in this context.
+    Lex();
+    IDVal = "{";
+  } else if (Lexer.is(AsmToken::RCurly)) {
+    // Treat '}' as a valid identifier in this context.
+    Lex();
+    IDVal = "}";
+  } else if (KsSyntax == KS_OPT_SYNTAX_NASM && Lexer.is(AsmToken::LBrac)) {
+    // [bits xx]
+    Lex();
+    ID = Lexer.getTok();
+    if (ID.getString().lower() == "bits") {
+        Lex();
+        if (parseNasmDirectiveBits()) {
+            Info.KsError = KS_ERR_ASM_DIRECTIVE_ID;
+            return true;
+        } else {
+            return false;
+        }
+    } else {
+        Info.KsError = KS_ERR_ASM_DIRECTIVE_ID;
+        return true;
+    }
+  } else if (KsSyntax == KS_OPT_SYNTAX_NASM && isNasmDirective(ID.getString())) {
+      Lex();
+      IDVal = ID.getString();
+  } else if (parseIdentifier(IDVal)) {
+    if (!TheCondState.Ignore) {
+      // return TokError("unexpected token at start of statement");
+      Info.KsError = KS_ERR_ASM_STAT_TOKEN;
+      return true;
+    }
+    IDVal = "";
+  }
+
+  // Handle conditional assembly here before checking for skipping.  We
+  // have to do this so that .endif isn't skipped in a ".if 0" block for
+  // example.
+
+  StringMap<DirectiveKind>::const_iterator DirKindIt =
+      DirectiveKindMap.find(IDVal.lower());
+  DirectiveKind DirKind = (DirKindIt == DirectiveKindMap.end())
+                              ? DK_NO_DIRECTIVE
+                              : DirKindIt->getValue();
+  switch (DirKind) {
+  default:
+    break;
+  case DK_IF:
+  case DK_IFEQ:
+  case DK_IFGE:
+  case DK_IFGT:
+  case DK_IFLE:
+  case DK_IFLT:
+  case DK_IFNE:
+    return parseDirectiveIf(IDLoc, DirKind);
+  case DK_IFB:
+    return parseDirectiveIfb(IDLoc, true);
+  case DK_IFNB:
+    return parseDirectiveIfb(IDLoc, false);
+  case DK_IFC:
+    return parseDirectiveIfc(IDLoc, true);
+  case DK_IFEQS:
+    return parseDirectiveIfeqs(IDLoc, true);
+  case DK_IFNC:
+    return parseDirectiveIfc(IDLoc, false);
+  case DK_IFNES:
+    return parseDirectiveIfeqs(IDLoc, false);
+  case DK_IFDEF:
+    return parseDirectiveIfdef(IDLoc, true);
+  case DK_IFNDEF:
+  case DK_IFNOTDEF:
+    return parseDirectiveIfdef(IDLoc, false);
+  case DK_ELSEIF:
+    return parseDirectiveElseIf(IDLoc);
+  case DK_ELSE:
+    return parseDirectiveElse(IDLoc);
+  case DK_ENDIF:
+    return parseDirectiveEndIf(IDLoc);
+  }
+
+  // Ignore the statement if in the middle of inactive conditional
+  // (e.g. ".if 0").
+  if (TheCondState.Ignore) {
+    eatToEndOfStatement();
+    return false;
+  }
+
+  // FIXME: Recurse on local labels?
+
+  // See what kind of statement we have.
+  switch (Lexer.getKind()) {
+  case AsmToken::Colon: {
+    bool valid;
+    if (!getTargetParser().isLabel(ID, valid))
+      break;
+    if (!valid) {
+        Info.KsError = KS_ERR_ASM_LABEL_INVALID;
+        return true;
+    }
+    checkForValidSection();
+
+    // identifier ':'   -> Label.
+    Lex();
+
+    // Diagnose attempt to use '.' as a label.
+    if (IDVal == ".") {
+      //return Error(IDLoc, "invalid use of pseudo-symbol '.' as a label");
+      KsError = KS_ERR_ASM_INVALIDOPERAND;
+      return true;
+    }
+
+    // Diagnose attempt to use a variable as a label.
+    //
+    // FIXME: Diagnostics. Note the location of the definition as a label.
+    // FIXME: This doesn't diagnose assignment to a symbol which has been
+    // implicitly marked as external.
+    MCSymbol *Sym;
+    if (LocalLabelVal == -1) {
+      if (ParsingInlineAsm && SI) {
+        StringRef RewrittenLabel =
+            SI->LookupInlineAsmLabel(IDVal, getSourceManager(), IDLoc, true);
+        assert(RewrittenLabel.size() &&
+               "We should have an internal name here.");
+        Info.AsmRewrites->emplace_back(AOK_Label, IDLoc, IDVal.size(),
+                                       RewrittenLabel);
+        IDVal = RewrittenLabel;
+      }
+      if (IDVal.empty()) {
+          return true;
+      }
+      Sym = getContext().getOrCreateSymbol(IDVal);
+    } else {
+      bool valid;
+      Sym = Ctx.createDirectionalLocalSymbol(LocalLabelVal, valid);
+      if (!valid) {
+          Info.KsError = KS_ERR_ASM_LABEL_INVALID;
+          return true;
+      }
+    }
+
+    Sym->redefineIfPossible();
+
+    if (!Sym->isUndefined() || Sym->isVariable()) {
+      //return Error(IDLoc, "invalid symbol redefinition");
+      Info.KsError = KS_ERR_ASM_SYMBOL_REDEFINED;
+      return true;
+    }
+
+    // Emit the label.
+    if (!ParsingInlineAsm)
+      Out.EmitLabel(Sym);
+
+    getTargetParser().onLabelParsed(Sym);
+
+    // Consume any end of statement token, if present, to avoid spurious
+    // AddBlankLine calls().
+    if (Lexer.is(AsmToken::EndOfStatement)) {
+      Lex();
+      if (Lexer.is(AsmToken::Eof))
+        return false;
+    }
+
+    return false;
+  }
+
+  case AsmToken::Equal:
+    if (!getTargetParser().equalIsAsmAssignment())
+      break;
+    // identifier '=' ... -> assignment statement
+    Lex();
+
+    if (parseAssignment(IDVal, true)) {
+        Info.KsError = KS_ERR_ASM_DIRECTIVE_EQU;
+        return true;
+    }
+    return false;
+
+  default: // Normal instruction or directive.
+    break;
+  }
+
+  // If macros are enabled, check to see if this is a macro instantiation.
+  if (areMacrosEnabled())
+    if (const MCAsmMacro *M = lookupMacro(IDVal)) {
+      return handleMacroEntry(M, IDLoc);
+    }
+
+  // Otherwise, we have a normal instruction or directive.
+  if (isDirective(IDVal)) {
+    // There are several entities interested in parsing directives:
+    //
+    // 1. The target-specific assembly parser. Some directives are target
+    //    specific or may potentially behave differently on certain targets.
+    // 2. Asm parser extensions. For example, platform-specific parsers
+    //    (like the ELF parser) register themselves as extensions.
+    // 3. The generic directive parser implemented by this class. These are
+    //    all the directives that behave in a target and platform independent
+    //    manner, or at least have a default behavior that's shared between
+    //    all targets and platforms.
+
+    // First query the target-specific parser. It will return 'true' if it
+    // isn't interested in this directive.
+      uint64_t BytesInFragment = getStreamer().getCurrentFragmentSize();
+      if (!getTargetParser().ParseDirective(ID)){
+        // increment the address for the next statement if the directive
+        // has emitted any value to the streamer.
+        Address += getStreamer().getCurrentFragmentSize() - BytesInFragment;
+        return false;
+        }
+
+    // Next, check the extension directive map to see if any extension has
+    // registered itself to parse this directive.
+    std::pair<MCAsmParserExtension *, DirectiveHandler> Handler =
+        ExtensionDirectiveMap.lookup(IDVal);
+    if (Handler.first)
+      return (*Handler.second)(Handler.first, IDVal, IDLoc);
+
+    // Finally, if no one else is interested in this directive, it must be
+    // generic and familiar to this class.
+    switch (DirKind) {
+    default:
+      break;
+    case DK_SET:
+    case DK_EQU:
+      return parseDirectiveSet(IDVal, true);
+    case DK_EQUIV:
+      return parseDirectiveSet(IDVal, false);
+    case DK_ASCII:
+      return parseDirectiveAscii(IDVal, false);
+    case DK_ASCIZ:
+    case DK_STRING:
+      return parseDirectiveAscii(IDVal, true);
+    case DK_BYTE:
+      return parseDirectiveValue(1, Info.KsError);
+    case DK_SHORT:
+    case DK_VALUE:
+    case DK_2BYTE:
+      return parseDirectiveValue(2, Info.KsError);
+    case DK_LONG:
+    case DK_INT:
+    case DK_4BYTE:
+      return parseDirectiveValue(4, Info.KsError);
+    case DK_QUAD:
+    case DK_8BYTE:
+      return parseDirectiveValue(8, Info.KsError);
+    case DK_OCTA:
+      return parseDirectiveOctaValue(Info.KsError);
+    case DK_SINGLE:
+    case DK_FLOAT:
+      return parseDirectiveRealValue(APFloat::IEEEsingle);
+    case DK_DOUBLE:
+      return parseDirectiveRealValue(APFloat::IEEEdouble);
+    case DK_ALIGN: {
+      bool IsPow2 = !getContext().getAsmInfo()->getAlignmentIsInBytes();
+      return parseDirectiveAlign(IsPow2, /*ExprSize=*/1);
+    }
+    case DK_ALIGN32: {
+      bool IsPow2 = !getContext().getAsmInfo()->getAlignmentIsInBytes();
+      return parseDirectiveAlign(IsPow2, /*ExprSize=*/4);
+    }
+    case DK_BALIGN:
+      return parseDirectiveAlign(/*IsPow2=*/false, /*ExprSize=*/1);
+    case DK_BALIGNW:
+      return parseDirectiveAlign(/*IsPow2=*/false, /*ExprSize=*/2);
+    case DK_BALIGNL:
+      return parseDirectiveAlign(/*IsPow2=*/false, /*ExprSize=*/4);
+    case DK_P2ALIGN:
+      return parseDirectiveAlign(/*IsPow2=*/true, /*ExprSize=*/1);
+    case DK_P2ALIGNW:
+      return parseDirectiveAlign(/*IsPow2=*/true, /*ExprSize=*/2);
+    case DK_P2ALIGNL:
+      return parseDirectiveAlign(/*IsPow2=*/true, /*ExprSize=*/4);
+    case DK_ORG:
+      return parseDirectiveOrg();
+    case DK_FILL:
+      return parseDirectiveFill();
+    case DK_ZERO:
+      return parseDirectiveZero();
+    case DK_EXTERN:
+      eatToEndOfStatement(); // .extern is the default, ignore it.
+      return false;
+    case DK_GLOBL:
+    case DK_GLOBAL:
+      return parseDirectiveSymbolAttribute(MCSA_Global);
+    case DK_LAZY_REFERENCE:
+      return parseDirectiveSymbolAttribute(MCSA_LazyReference);
+    case DK_NO_DEAD_STRIP:
+      return parseDirectiveSymbolAttribute(MCSA_NoDeadStrip);
+    case DK_SYMBOL_RESOLVER:
+      return parseDirectiveSymbolAttribute(MCSA_SymbolResolver);
+    case DK_PRIVATE_EXTERN:
+      return parseDirectiveSymbolAttribute(MCSA_PrivateExtern);
+    case DK_REFERENCE:
+      return parseDirectiveSymbolAttribute(MCSA_Reference);
+    case DK_WEAK_DEFINITION:
+      return parseDirectiveSymbolAttribute(MCSA_WeakDefinition);
+    case DK_WEAK_REFERENCE:
+      return parseDirectiveSymbolAttribute(MCSA_WeakReference);
+    case DK_WEAK_DEF_CAN_BE_HIDDEN:
+      return parseDirectiveSymbolAttribute(MCSA_WeakDefAutoPrivate);
+    case DK_COMM:
+    case DK_COMMON:
+      return parseDirectiveComm(/*IsLocal=*/false);
+    case DK_LCOMM:
+      return parseDirectiveComm(/*IsLocal=*/true);
+    case DK_ABORT:
+      return parseDirectiveAbort();
+    case DK_INCLUDE:
+      return parseDirectiveInclude();
+    case DK_INCBIN:
+      return parseDirectiveIncbin();
+    case DK_CODE16:
+    case DK_CODE16GCC:
+      // return TokError(Twine(IDVal) + " not supported yet");
+      Info.KsError = KS_ERR_ASM_UNSUPPORTED;
+      return true;
+    case DK_REPT:
+      return parseDirectiveRept(IDLoc, IDVal);
+    case DK_IRP:
+      return parseDirectiveIrp(IDLoc);
+    case DK_IRPC:
+      return parseDirectiveIrpc(IDLoc);
+    case DK_ENDR:
+      return parseDirectiveEndr(IDLoc);
+    case DK_BUNDLE_ALIGN_MODE:
+      return parseDirectiveBundleAlignMode();
+    case DK_BUNDLE_LOCK:
+      return parseDirectiveBundleLock();
+    case DK_BUNDLE_UNLOCK:
+      return parseDirectiveBundleUnlock();
+    case DK_SLEB128:
+      return parseDirectiveLEB128(true);
+    case DK_ULEB128:
+      return parseDirectiveLEB128(false);
+    case DK_SPACE:
+    case DK_SKIP:
+      return parseDirectiveSpace(IDVal);
+    case DK_FILE:
+      return parseDirectiveFile(IDLoc);
+    case DK_LINE:
+      return parseDirectiveLine();
+    case DK_LOC:
+      return parseDirectiveLoc();
+    case DK_STABS:
+      return parseDirectiveStabs();
+    case DK_CV_FILE:
+      return parseDirectiveCVFile();
+    case DK_CV_LOC:
+      return parseDirectiveCVLoc();
+    case DK_CV_LINETABLE:
+      return parseDirectiveCVLinetable();
+    case DK_CV_INLINE_LINETABLE:
+      return parseDirectiveCVInlineLinetable();
+    case DK_CV_STRINGTABLE:
+      return parseDirectiveCVStringTable();
+    case DK_CV_FILECHECKSUMS:
+      return parseDirectiveCVFileChecksums();
+    case DK_CFI_SECTIONS:
+      return parseDirectiveCFISections();
+    case DK_CFI_STARTPROC:
+      return parseDirectiveCFIStartProc();
+    case DK_CFI_ENDPROC:
+      return parseDirectiveCFIEndProc();
+    case DK_CFI_DEF_CFA:
+      return parseDirectiveCFIDefCfa(IDLoc);
+    case DK_CFI_DEF_CFA_OFFSET:
+      return parseDirectiveCFIDefCfaOffset();
+    case DK_CFI_ADJUST_CFA_OFFSET:
+      return parseDirectiveCFIAdjustCfaOffset();
+    case DK_CFI_DEF_CFA_REGISTER:
+      return parseDirectiveCFIDefCfaRegister(IDLoc);
+    case DK_CFI_OFFSET:
+      return parseDirectiveCFIOffset(IDLoc);
+    case DK_CFI_REL_OFFSET:
+      return parseDirectiveCFIRelOffset(IDLoc);
+    case DK_CFI_PERSONALITY:
+      return parseDirectiveCFIPersonalityOrLsda(true);
+    case DK_CFI_LSDA:
+      return parseDirectiveCFIPersonalityOrLsda(false);
+    case DK_CFI_REMEMBER_STATE:
+      return parseDirectiveCFIRememberState();
+    case DK_CFI_RESTORE_STATE:
+      return parseDirectiveCFIRestoreState();
+    case DK_CFI_SAME_VALUE:
+      return parseDirectiveCFISameValue(IDLoc);
+    case DK_CFI_RESTORE:
+      return parseDirectiveCFIRestore(IDLoc);
+    case DK_CFI_ESCAPE:
+      return parseDirectiveCFIEscape();
+    case DK_CFI_SIGNAL_FRAME:
+      return parseDirectiveCFISignalFrame();
+    case DK_CFI_UNDEFINED:
+      return parseDirectiveCFIUndefined(IDLoc);
+    case DK_CFI_REGISTER:
+      return parseDirectiveCFIRegister(IDLoc);
+    case DK_CFI_WINDOW_SAVE:
+      return parseDirectiveCFIWindowSave();
+    case DK_MACROS_ON:
+    case DK_MACROS_OFF:
+      return parseDirectiveMacrosOnOff(IDVal);
+    case DK_MACRO:
+      return parseDirectiveMacro(IDLoc);
+    case DK_EXITM:
+      return parseDirectiveExitMacro(IDVal);
+    case DK_ENDM:
+    case DK_ENDMACRO:
+      return parseDirectiveEndMacro(IDVal);
+    case DK_PURGEM:
+      return parseDirectivePurgeMacro(IDLoc);
+    case DK_END:
+      return parseDirectiveEnd(IDLoc);
+    case DK_ERR:
+      return parseDirectiveError(IDLoc, false);
+    case DK_ERROR:
+      return parseDirectiveError(IDLoc, true);
+    case DK_WARNING:
+      return parseDirectiveWarning(IDLoc);
+    case DK_RELOC:
+      return parseDirectiveReloc(IDLoc);
+    case DK_NASM_BITS:
+      if (parseNasmDirectiveBits()) {
+          Info.KsError = KS_ERR_ASM_DIRECTIVE_ID;
+          return true;
+      } else {
+          return false;
+      }
+    case DK_NASM_USE32:
+      return parseNasmDirectiveUse32();
+    case DK_NASM_DEFAULT:
+      if (parseNasmDirectiveDefault()) {
+        Info.KsError = KS_ERR_ASM_DIRECTIVE_ID;
+        return true;
+      } else {
+        return false;
+      }
+    }
+
+    //return Error(IDLoc, "unknown directive");
+    KsError = KS_ERR_ASM_DIRECTIVE_UNKNOWN;
+    return true;
+  }
+
+  // __asm _emit or __asm __emit
+  if (ParsingInlineAsm && (IDVal == "_emit" || IDVal == "__emit" ||
+                           IDVal == "_EMIT" || IDVal == "__EMIT"))
+    return parseDirectiveMSEmit(IDLoc, Info, IDVal.size());
+
+  // __asm align
+  if (ParsingInlineAsm && (IDVal == "align" || IDVal == "ALIGN"))
+    return parseDirectiveMSAlign(IDLoc, Info);
+
+  if (ParsingInlineAsm && (IDVal == "even"))
+    Info.AsmRewrites->emplace_back(AOK_EVEN, IDLoc, 4);
+  checkForValidSection();
+
+  // Canonicalize the opcode to lower case.
+  std::string OpcodeStr = IDVal.lower();
+  ParseInstructionInfo IInfo(Info.AsmRewrites);
+  //printf(">> Going to ParseInstruction()\n");
+  bool HadError = getTargetParser().ParseInstruction(IInfo, OpcodeStr, ID,
+                                                     Info.ParsedOperands, Info.KsError);
+  Info.ParseError = HadError;
+
+  // If parsing succeeded, match the instruction.
+  if (!HadError) {
+    uint64_t ErrorInfo;
+    //printf(">> Going to MatchAndEmitInstruction()\n");
+    return getTargetParser().MatchAndEmitInstruction(IDLoc, Info.Opcode,
+                                              Info.ParsedOperands, Out,
+                                              ErrorInfo, ParsingInlineAsm,
+                                              Info.KsError, Address);
+  }
+
+  return true;
+}
+
+bool AsmParser::parseStatement(ParseStatementInfo &Info,
+                               MCAsmParserSemaCallback *SI, uint64_t &Address, bool is_ppc)
 {
   KsError = 0;
   if (Lexer.is(AsmToken::EndOfStatement)) {
@@ -1956,6 +2516,9 @@ bool AsmParser::parseStatement(ParseStatementInfo &Info,
   if (!HadError) {
     uint64_t ErrorInfo;
     //printf(">> Going to MatchAndEmitInstruction()\n");
+      if (is_ppc && Lexer.is(AsmToken::EndOfStatement))
+        Lex();
+
     return getTargetParser().MatchAndEmitInstruction(IDLoc, Info.Opcode,
                                               Info.ParsedOperands, Out,
                                               ErrorInfo, ParsingInlineAsm,

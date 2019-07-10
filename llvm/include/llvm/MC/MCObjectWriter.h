@@ -119,7 +119,7 @@ public:
   /// complete, fixups have been evaluated and applied, and relocations
   /// generated.
   virtual void writeObject(MCAssembler &Asm, const MCAsmLayout &Layout) = 0;
-
+  virtual void writeObject(MCAssembler &Asm, const MCAsmLayout &Layout, std::vector<int> &size_of_instructions) = 0;
   /// @}
   /// \name Binary Output
   /// @{

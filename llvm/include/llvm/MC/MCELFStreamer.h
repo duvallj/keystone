@@ -78,6 +78,8 @@ public:
 
   unsigned int FinishImpl() override;
 
+  unsigned int FinishImpl(std::vector<int> &size_of_instructions);
+
   void EmitBundleAlignMode(unsigned AlignPow2) override;
   void EmitBundleLock(bool AlignToEnd) override;
   void EmitBundleUnlock() override;

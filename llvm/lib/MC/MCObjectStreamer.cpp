@@ -257,26 +257,30 @@ void MCObjectStreamer::EmitInstruction(MCInst &Inst,
   //MCDwarfLineEntry::Make(this, getCurrentSection().first);
 
   // If this instruction doesn't need relaxation, just emit it as data.
-  MCAssembler &Assembler = getAssembler();
-  if (!Assembler.getBackend().mayNeedRelaxation(Inst)) {
-    EmitInstToData(Inst, STI, KsError);
-    return;
-  }
 
-  // Otherwise, relax and emit it as data if either:
-  // - The RelaxAll flag was passed
-  // - Bundling is enabled and this instruction is inside a bundle-locked
-  //   group. We want to emit all such instructions into the same data
-  //   fragment.
-  if (Assembler.getRelaxAll() ||
-      (Assembler.isBundlingEnabled() && Sec->isBundleLocked())) {
-    MCInst Relaxed(Inst.getAddress());
-    getAssembler().getBackend().relaxInstruction(Inst, Relaxed);
-    while (getAssembler().getBackend().mayNeedRelaxation(Relaxed))
-      getAssembler().getBackend().relaxInstruction(Relaxed, Relaxed);
-    EmitInstToData(Relaxed, STI, KsError);
-    return;
-  }
+  //For my pwnasm hack
+  //-------------------
+  // MCAssembler &Assembler = getAssembler();
+  // if (!Assembler.getBackend().mayNeedRelaxation(Inst)) {
+  //   EmitInstToData(Inst, STI, KsError);
+  //   return;
+  // }
+
+  // // Otherwise, relax and emit it as data if either:
+  // // - The RelaxAll flag was passed
+  // // - Bundling is enabled and this instruction is inside a bundle-locked
+  // //   group. We want to emit all such instructions into the same data
+  // //   fragment.
+  // if (Assembler.getRelaxAll() ||
+  //     (Assembler.isBundlingEnabled() && Sec->isBundleLocked())) {
+  //   MCInst Relaxed(Inst.getAddress());
+  //   getAssembler().getBackend().relaxInstruction(Inst, Relaxed);
+  //   while (getAssembler().getBackend().mayNeedRelaxation(Relaxed))
+  //     getAssembler().getBackend().relaxInstruction(Relaxed, Relaxed);
+  //   EmitInstToData(Relaxed, STI, KsError);
+  //   return;
+  // }
+  //------------------
 
   // Otherwise emit to a separate fragment.
   EmitInstToFragment(Inst, STI);
@@ -508,6 +512,23 @@ void MCObjectStreamer::EmitFill(uint64_t NumBytes, uint8_t FillValue) {
   (void)Sec;
   assert(Sec && "need a section");
   insert(new MCFillFragment(FillValue, NumBytes));
+}
+
+unsigned int MCObjectStreamer::FinishImpl(std::vector<int> &size_of_instructions)
+{
+  unsigned int KsError = 0;
+  // If we are generating dwarf for assembly source files dump out the sections.
+  //if (getContext().getGenDwarfForAssembly())
+  //  MCGenDwarfInfo::Emit(this);
+
+  // Dump out the dwarf file & directory tables and line tables.
+  //MCDwarfLineTable::Emit(this, getAssembler().getDWARFLinetableParams());
+
+  flushPendingLabels(nullptr);
+  getAssembler().setSymResolver(getSymResolver());
+  getAssembler().Finish(KsError, size_of_instructions);
+
+  return KsError;
 }
 
 unsigned int MCObjectStreamer::FinishImpl()

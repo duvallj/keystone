@@ -138,6 +138,7 @@ public:
                           const MCExpr *Expr, SMLoc Loc) override;
   void EmitFill(uint64_t NumBytes, uint8_t FillValue) override;
   unsigned int FinishImpl() override;
+  unsigned int FinishImpl(std::vector<int> &size_of_instructions);
 
   /// Emit the absolute difference between two symbols if possible.
   ///

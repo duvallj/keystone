@@ -225,6 +225,8 @@ public:
   /// Emit the section contents using the given object writer.
   void writeSectionData(const MCSection *Section,
                         const MCAsmLayout &Layout) const;
+  void writeSectionData(const MCSection *Section,
+                        const MCAsmLayout &Layout, std::vector<int> &size_of_instructions) const;
 
   /// Check whether a given symbol has been flagged with .thumb_func.
   bool isThumbFunc(const MCSymbol *Func) const;
@@ -276,6 +278,7 @@ public:
   /// \p Writer is used for custom object writer (as the MCJIT does),
   /// if not specified it is automatically created from backend.
   void Finish(unsigned int &KsError);
+  void Finish(unsigned int &KsError, std::vector<int> &size_of_instructions);
 
   // Layout all section and prepare them for emission.
   void layout(MCAsmLayout &Layout, unsigned int &KsError);

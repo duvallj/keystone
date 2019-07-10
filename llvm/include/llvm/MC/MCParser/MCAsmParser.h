@@ -107,6 +107,7 @@ public:
 
   /// \brief Run the parser on the input source buffer.
   virtual size_t Run(bool NoInitialTextSection, uint64_t Address, bool NoFinalize = false) = 0;
+  virtual std::vector<int> get_instruction_sizes() = 0;
 
   virtual void setParsingInlineAsm(bool V) = 0;
   virtual bool isParsingInlineAsm() = 0;

@@ -339,7 +339,8 @@ uint64_t MCAssembler::computeFragmentSize(const MCAsmLayout &Layout,
   case MCFragment::FT_DwarfFrame:
     return cast<MCDwarfCallFrameFragment>(F).getContents().size();
   case MCFragment::FT_Dummy:
-    llvm_unreachable("Should not have been added");
+    //llvm_unreachable("Should not have been added");
+  return 0;
   }
 
   llvm_unreachable("invalid fragment kind");
@@ -470,6 +471,143 @@ void MCAssembler::writeFragmentPadding(const MCFragment &F, uint64_t FSize,
 }
 
 /// \brief Write the fragment \p F to the output file.
+static void writeFragment(const MCAssembler &Asm, const MCAsmLayout &Layout,
+                          const MCFragment &F, std::vector<int> &size_of_instructions)
+{
+  if (Asm.getError())
+      return;
+
+  MCObjectWriter *OW = &Asm.getWriter();
+
+  bool valid;
+  // FIXME: Embed in fragments instead?
+  uint64_t FragmentSize = Asm.computeFragmentSize(Layout, F, valid);
+  if (!valid) {
+      Asm.setError(KS_ERR_ASM_FRAGMENT_INVALID);
+      return;
+  }
+
+  Asm.writeFragmentPadding(F, FragmentSize, OW);
+
+  // This variable (and its dummy usage) is to participate in the assert at
+  // the end of the function.
+  uint64_t Start = OW->getStream().tell();
+  (void) Start;
+
+  switch (F.getKind()) {
+  case MCFragment::FT_Align: {
+    const MCAlignFragment &AF = cast<MCAlignFragment>(F);
+    assert(AF.getValueSize() && "Invalid virtual align in concrete fragment!");
+
+    uint64_t Count = FragmentSize / AF.getValueSize();
+
+    // FIXME: This error shouldn't actually occur (the front end should emit
+    // multiple .align directives to enforce the semantics it wants), but is
+    // severe enough that we want to report it. How to handle this?
+    if (Count * AF.getValueSize() != FragmentSize)
+      report_fatal_error("undefined .align directive, value size '" +
+                        Twine(AF.getValueSize()) +
+                        "' is not a divisor of padding size '" +
+                        Twine(FragmentSize) + "'");
+
+    // See if we are aligning with nops, and if so do that first to try to fill
+    // the Count bytes.  Then if that did not fill any bytes or there are any
+    // bytes left to fill use the Value and ValueSize to fill the rest.
+    // If we are aligning with nops, ask that target to emit the right data.
+    if (AF.hasEmitNops()) {
+      if (!Asm.getBackend().writeNopData(Count, OW))
+        report_fatal_error("unable to write nop sequence of " +
+                          Twine(Count) + " bytes");
+      break;
+    }
+
+    // Otherwise, write out in multiples of the value size.
+    for (uint64_t i = 0; i != Count; ++i) {
+      switch (AF.getValueSize()) {
+      default: llvm_unreachable("Invalid size!");
+      case 1: OW->write8 (uint8_t (AF.getValue())); break;
+      case 2: OW->write16(uint16_t(AF.getValue())); break;
+      case 4: OW->write32(uint32_t(AF.getValue())); break;
+      case 8: OW->write64(uint64_t(AF.getValue())); break;
+      }
+    }
+    break;
+  }
+
+  case MCFragment::FT_Data: 
+    OW->writeBytes(cast<MCDataFragment>(F).getContents());
+    break;
+
+  case MCFragment::FT_Relaxable:
+    OW->writeBytes(cast<MCRelaxableFragment>(F).getContents());
+    break;
+
+  case MCFragment::FT_CompactEncodedInst:
+    OW->writeBytes(cast<MCCompactEncodedInstFragment>(F).getContents());
+    break;
+
+  case MCFragment::FT_Fill: {
+    const MCFillFragment &FF = cast<MCFillFragment>(F);
+    uint8_t V = FF.getValue();
+    const unsigned MaxChunkSize = 16;
+    char Data[MaxChunkSize];
+    memcpy(Data, &V, 1);
+    for (unsigned I = 1; I < MaxChunkSize; ++I)
+      Data[I] = Data[0];
+
+    uint64_t Size = FF.getSize();
+    for (unsigned ChunkSize = MaxChunkSize; ChunkSize; ChunkSize /= 2) {
+      StringRef Ref(Data, ChunkSize);
+      for (uint64_t I = 0, E = Size / ChunkSize; I != E; ++I)
+        OW->writeBytes(Ref);
+      Size = Size % ChunkSize;
+    }
+    break;
+  }
+
+  case MCFragment::FT_LEB: {
+    const MCLEBFragment &LF = cast<MCLEBFragment>(F);
+    OW->writeBytes(LF.getContents());
+    break;
+  }
+
+  case MCFragment::FT_SafeSEH: {
+    const MCSafeSEHFragment &SF = cast<MCSafeSEHFragment>(F);
+    OW->write32(SF.getSymbol()->getIndex());
+    break;
+  }
+
+  case MCFragment::FT_Org: {
+    const MCOrgFragment &OF = cast<MCOrgFragment>(F);
+
+    for (uint64_t i = 0, e = FragmentSize; i != e; ++i)
+      OW->write8(uint8_t(OF.getValue()));
+
+    break;
+  }
+
+  case MCFragment::FT_Dwarf: {
+    const MCDwarfLineAddrFragment &OF = cast<MCDwarfLineAddrFragment>(F);
+    OW->writeBytes(OF.getContents());
+    break;
+  }
+  case MCFragment::FT_DwarfFrame: {
+    const MCDwarfCallFrameFragment &CF = cast<MCDwarfCallFrameFragment>(F);
+    OW->writeBytes(CF.getContents());
+    break;
+  }
+  case MCFragment::FT_Dummy:
+    // llvm_unreachable("Should not have been added");
+    size_of_instructions.push_back(-1);
+    return;
+  }
+
+  assert(OW->getStream().tell() - Start == FragmentSize &&
+         "The stream should advance by fragment size");
+
+  size_of_instructions.push_back(FragmentSize);
+}
+
 static void writeFragment(const MCAssembler &Asm, const MCAsmLayout &Layout,
                           const MCFragment &F)
 {
@@ -652,8 +790,66 @@ void MCAssembler::writeSectionData(const MCSection *Sec,
   (void)Start;
 
   setError(0);
-  for (const MCFragment &F : *Sec)
+  for (const MCFragment &F : *Sec){
     writeFragment(*this, Layout, F);
+  }
+
+  //assert(getWriter().getStream().tell() - Start ==
+  //       Layout.getSectionAddressSize(Sec));
+}
+
+void MCAssembler::writeSectionData(const MCSection *Sec,
+                                   const MCAsmLayout &Layout, std::vector<int> &size_of_instructions) const
+{
+  // Ignore virtual sections.
+  if (Sec->isVirtualSection()) {
+    assert(Layout.getSectionFileSize(Sec) == 0 && "Invalid size for section!");
+
+    // Check that contents are only things legal inside a virtual section.
+    for (const MCFragment &F : *Sec) {
+      switch (F.getKind()) {
+      default: llvm_unreachable("Invalid fragment in virtual section!");
+      case MCFragment::FT_Data: {
+        // Check that we aren't trying to write a non-zero contents (or fixups)
+        // into a virtual section. This is to support clients which use standard
+        // directives to fill the contents of virtual sections.
+        const MCDataFragment &DF = cast<MCDataFragment>(F);
+        assert(DF.fixup_begin() == DF.fixup_end() &&
+               "Cannot have fixups in virtual section!");
+        for (unsigned i = 0, e = DF.getContents().size(); i != e; ++i)
+          if (DF.getContents()[i]) {
+            if (auto *ELFSec = dyn_cast<const MCSectionELF>(Sec))
+              report_fatal_error("non-zero initializer found in section '" +
+                  ELFSec->getSectionName() + "'");
+            else
+              report_fatal_error("non-zero initializer found in virtual section");
+          }
+        break;
+      }
+      case MCFragment::FT_Align:
+        // Check that we aren't trying to write a non-zero value into a virtual
+        // section.
+        assert((cast<MCAlignFragment>(F).getValueSize() == 0 ||
+                cast<MCAlignFragment>(F).getValue() == 0) &&
+               "Invalid align in virtual section!");
+        break;
+      case MCFragment::FT_Fill:
+        assert((cast<MCFillFragment>(F).getValue() == 0) &&
+               "Invalid fill in virtual section!");
+        break;
+      }
+    }
+
+    return;
+  }
+
+  uint64_t Start = getWriter().getStream().tell();
+  (void)Start;
+
+  setError(0);
+  for (const MCFragment &F : *Sec){
+    writeFragment(*this, Layout, F, size_of_instructions);
+  }
 
   //assert(getWriter().getStream().tell() - Start ==
   //       Layout.getSectionAddressSize(Sec));
@@ -767,6 +963,18 @@ void MCAssembler::layout(MCAsmLayout &Layout, unsigned int &KsError)
             return;
       }
     }
+  }
+}
+
+void MCAssembler::Finish(unsigned int &KsError, std::vector<int> &size_of_instructions) {
+  // Create the layout object.
+  MCAsmLayout Layout(*this);
+  layout(Layout, KsError);
+
+  // Write the object file.
+  if (!KsError) {
+      getWriter().writeObject(*this, Layout, size_of_instructions);
+      KsError = getError();
   }
 }
 

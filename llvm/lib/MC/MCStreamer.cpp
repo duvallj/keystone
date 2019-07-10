@@ -622,6 +622,17 @@ void MCStreamer::EmitRawText(const Twine &T) {
 void MCStreamer::EmitWindowsUnwindTables() {
 }
 
+unsigned int MCStreamer::Finish(std::vector<int> &size_of_instructions) {
+  if (!DwarfFrameInfos.empty() && !DwarfFrameInfos.back().End)
+    report_fatal_error("Unfinished frame!");
+
+  MCTargetStreamer *TS = getTargetStreamer();
+  if (TS)
+    TS->finish();
+
+  return FinishImpl(size_of_instructions);
+}
+
 unsigned int MCStreamer::Finish() {
   if (!DwarfFrameInfos.empty() && !DwarfFrameInfos.back().End)
     report_fatal_error("Unfinished frame!");
@@ -734,6 +745,7 @@ void MCStreamer::emitValueToOffset(const MCExpr *Offset, unsigned char Value) {}
 void MCStreamer::EmitBundleAlignMode(unsigned AlignPow2) {}
 void MCStreamer::EmitBundleLock(bool AlignToEnd) {}
 unsigned int MCStreamer::FinishImpl() { return 0; }
+unsigned int MCStreamer::FinishImpl(std::vector<int> &size_of_instructions) { return 0; }
 void MCStreamer::EmitBundleUnlock() {}
 
 void MCStreamer::SwitchSection(MCSection *Section, const MCExpr *Subsection) {

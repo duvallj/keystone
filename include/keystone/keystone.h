@@ -45,6 +45,11 @@ typedef struct ks_struct ks_engine;
 */
 #define KS_MAKE_VERSION(major, minor) ((major << 8) + minor)
 
+typedef struct ks_instruction{
+    int size;
+    unsigned char *instruction;
+} ks_instruction;
+
 // Architecture type
 typedef enum ks_arch {
     KS_ARCH_ARM = 1,    // ARM architecture (including Thumb, Thumb-2)
@@ -311,11 +316,15 @@ ks_err ks_option(ks_engine *ks, ks_opt_type type, size_t value);
 */
 KEYSTONE_EXPORT
 int ks_asm(ks_engine *ks,
-        const char *string,
+        const char *assembly,
         uint64_t address,
-        unsigned char **encoding, size_t *encoding_size,
+        unsigned char **insn, size_t *insn_size,
         size_t *stat_count);
-
+KEYSTONE_EXPORT
+int ks_asm_new(ks_engine *ks,
+        const char *assembly,
+        uint64_t address,
+        size_t *stat_count, ks_instruction (**ks_instructions)[0]);
 
 /*
  Free memory allocated by ks_asm()
@@ -324,6 +333,9 @@ int ks_asm(ks_engine *ks,
 */
 KEYSTONE_EXPORT
 void ks_free(unsigned char *p);
+
+KEYSTONE_EXPORT
+void ks_free_new(ks_instruction (*ks_instructions)[0], size_t num_of_instructions);
 
 
 #ifdef __cplusplus

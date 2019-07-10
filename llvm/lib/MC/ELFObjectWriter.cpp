@@ -210,6 +210,9 @@ class ELFObjectWriter : public MCObjectWriter {
     void writeSectionData(const MCAssembler &Asm, MCSection &Sec,
                           const MCAsmLayout &Layout);
 
+    void writeSectionData(const MCAssembler &Asm, MCSection &Sec,
+                          const MCAsmLayout &Layout, std::vector<int> &size_of_instructions);
+
     void WriteSecHdrEntry(uint32_t Name, uint32_t Type, uint64_t Flags,
                           uint64_t Address, uint64_t Offset, uint64_t Size,
                           uint32_t Link, uint32_t Info, uint64_t Alignment,
@@ -226,6 +229,7 @@ class ELFObjectWriter : public MCObjectWriter {
     bool isWeak(const MCSymbol &Sym) const override;
 
     void writeObject(MCAssembler &Asm, const MCAsmLayout &Layout) override;
+    void writeObject(MCAssembler &Asm, const MCAsmLayout &Layout, std::vector<int> &size_of_instructions);
     void writeSection(const SectionIndexMapTy &SectionIndexMap,
                       uint32_t GroupSymbolIndex, uint64_t Offset, uint64_t Size,
                       const MCSectionELF &Section);
@@ -948,6 +952,47 @@ void ELFObjectWriter::writeSectionData(const MCAssembler &Asm, MCSection &Sec,
 #endif
 }
 
+void ELFObjectWriter::writeSectionData(const MCAssembler &Asm, MCSection &Sec,
+                                       const MCAsmLayout &Layout, std::vector<int> &size_of_instructions) {
+  MCSectionELF &Section = static_cast<MCSectionELF &>(Sec);
+  StringRef SectionName = Section.getSectionName();
+
+  // Compressing debug_frame requires handling alignment fragments which is
+  // more work (possibly generalizing MCAssembler.cpp:writeFragment to allow
+  // for writing to arbitrary buffers) for little benefit.
+  if (!Asm.getContext().getAsmInfo()->compressDebugSections() ||
+      !SectionName.startswith(".debug_") || SectionName == ".debug_frame") {
+    Asm.writeSectionData(&Section, Layout, size_of_instructions);
+    return;
+  }
+
+  SmallVector<char, 128> UncompressedData;
+  raw_svector_ostream VecOS(UncompressedData);
+  raw_pwrite_stream &OldStream = getStream();
+  setStream(VecOS);
+  Asm.writeSectionData(&Section, Layout, size_of_instructions);
+  setStream(OldStream);
+
+#if 0
+  SmallVector<char, 128> CompressedContents;
+  zlib::Status Success = zlib::compress(
+      StringRef(UncompressedData.data(), UncompressedData.size()),
+      CompressedContents);
+  if (Success != zlib::StatusOK) {
+    getStream() << UncompressedData;
+    return;
+  }
+
+  if (!prependCompressionHeader(UncompressedData.size(), CompressedContents)) {
+    getStream() << UncompressedData;
+    return;
+  }
+  Asm.getContext().renameELFSection(&Section,
+                                    (".z" + SectionName.drop_front(1)).str());
+  getStream() << CompressedContents;
+#endif
+}
+
 void ELFObjectWriter::WriteSecHdrEntry(uint32_t Name, uint32_t Type,
                                        uint64_t Flags, uint64_t Address,
                                        uint64_t Offset, uint64_t Size,
@@ -1124,6 +1169,7 @@ void ELFObjectWriter::writeObject(MCAssembler &Asm,
     uint64_t SecStart = getStream().tell();
 
     const MCSymbolELF *SignatureSymbol = Section.getGroup();
+
     writeSectionData(Asm, Section, Layout);
     if (Asm.getError())
         return;
@@ -1186,6 +1232,141 @@ return;
     uint64_t SecStart = getStream().tell();
 
     writeRelocations(Asm, *RelSection->getAssociatedSection());	// qq
+
+    uint64_t SecEnd = getStream().tell();
+    SectionOffsets[RelSection] = std::make_pair(SecStart, SecEnd);
+  }
+
+  {
+    uint64_t SecStart = getStream().tell();
+    const MCSectionELF *Sec = createStringTable(Ctx);
+    uint64_t SecEnd = getStream().tell();
+    SectionOffsets[Sec] = std::make_pair(SecStart, SecEnd);
+  }
+
+  uint64_t NaturalAlignment = is64Bit() ? 8 : 4;
+  align(NaturalAlignment);
+
+  const uint64_t SectionHeaderOffset = getStream().tell();
+
+  // ... then the section header table ...
+  writeSectionHeader(Layout, SectionIndexMap, SectionOffsets);
+
+  uint16_t NumSections = (SectionTable.size() + 1 >= ELF::SHN_LORESERVE)
+                             ? (uint16_t)ELF::SHN_UNDEF
+                             : SectionTable.size() + 1;
+  if (sys::IsLittleEndianHost != IsLittleEndian)
+    sys::swapByteOrder(NumSections);
+  unsigned NumSectionsOffset;
+
+  if (is64Bit()) {
+    uint64_t Val = SectionHeaderOffset;
+    if (sys::IsLittleEndianHost != IsLittleEndian)
+      sys::swapByteOrder(Val);
+    getStream().pwrite(reinterpret_cast<char *>(&Val), sizeof(Val),
+                       offsetof(ELF::Elf64_Ehdr, e_shoff));
+    NumSectionsOffset = offsetof(ELF::Elf64_Ehdr, e_shnum);
+  } else {
+    uint32_t Val = SectionHeaderOffset;
+    if (sys::IsLittleEndianHost != IsLittleEndian)
+      sys::swapByteOrder(Val);
+    getStream().pwrite(reinterpret_cast<char *>(&Val), sizeof(Val),
+                       offsetof(ELF::Elf32_Ehdr, e_shoff));
+    NumSectionsOffset = offsetof(ELF::Elf32_Ehdr, e_shnum);
+  }
+  getStream().pwrite(reinterpret_cast<char *>(&NumSections),
+                     sizeof(NumSections), NumSectionsOffset);
+}
+
+void ELFObjectWriter::writeObject(MCAssembler &Asm,
+                                  const MCAsmLayout &Layout, std::vector<int> &size_of_instructions)
+{
+  MCContext &Ctx = Asm.getContext();
+  MCSectionELF *StrtabSection =
+      Ctx.getELFSection(".strtab", ELF::SHT_STRTAB, 0);
+  StringTableIndex = addToSectionTable(StrtabSection);
+
+  RevGroupMapTy RevGroupMap;
+  SectionIndexMapTy SectionIndexMap;
+
+  std::map<const MCSymbol *, std::vector<const MCSectionELF *>> GroupMembers;
+
+  // ... then the sections ...
+  SectionOffsetsTy SectionOffsets;
+  std::vector<MCSectionELF *> Groups;
+  std::vector<MCSectionELF *> Relocations;
+  for (MCSection &Sec : Asm) {
+    MCSectionELF &Section = static_cast<MCSectionELF &>(Sec);
+
+    align(Section.getAlignment());
+
+    // Remember the offset into the file for this section.
+    uint64_t SecStart = getStream().tell();
+
+    const MCSymbolELF *SignatureSymbol = Section.getGroup();
+
+    writeSectionData(Asm, Section, Layout, size_of_instructions);
+    if (Asm.getError())
+        return;
+
+    uint64_t SecEnd = getStream().tell();
+    SectionOffsets[&Section] = std::make_pair(SecStart, SecEnd);
+
+    MCSectionELF *RelSection = createRelocationSection(Ctx, Section);
+
+    if (SignatureSymbol) {
+      Asm.registerSymbol(*SignatureSymbol);
+      unsigned &GroupIdx = RevGroupMap[SignatureSymbol];
+      if (!GroupIdx) {
+        MCSectionELF *Group = Ctx.createELFGroupSection(SignatureSymbol);
+        GroupIdx = addToSectionTable(Group);
+        Group->setAlignment(4);
+        Groups.push_back(Group);
+      }
+      std::vector<const MCSectionELF *> &Members =
+          GroupMembers[SignatureSymbol];
+      Members.push_back(&Section);
+      if (RelSection)
+        Members.push_back(RelSection);
+    }
+
+    SectionIndexMap[&Section] = addToSectionTable(&Section);
+    if (RelSection) {
+      SectionIndexMap[RelSection] = addToSectionTable(RelSection);
+      Relocations.push_back(RelSection);
+    }
+  }
+
+return;
+
+  for (MCSectionELF *Group : Groups) {
+    align(Group->getAlignment());
+
+    // Remember the offset into the file for this section.
+    uint64_t SecStart = getStream().tell();
+
+    const MCSymbol *SignatureSymbol = Group->getGroup();
+    assert(SignatureSymbol);
+    write(uint32_t(ELF::GRP_COMDAT));
+    for (const MCSectionELF *Member : GroupMembers[SignatureSymbol]) {
+      uint32_t SecIndex = SectionIndexMap.lookup(Member);
+      write(SecIndex);
+    }
+
+    uint64_t SecEnd = getStream().tell();
+    SectionOffsets[Group] = std::make_pair(SecStart, SecEnd);
+  }
+
+  // Compute symbol table information.
+  computeSymbolTable(Asm, Layout, SectionIndexMap, RevGroupMap, SectionOffsets);
+
+  for (MCSectionELF *RelSection : Relocations) {
+    align(RelSection->getAlignment());
+
+    // Remember the offset into the file for this section.
+    uint64_t SecStart = getStream().tell();
+
+    writeRelocations(Asm, *RelSection->getAssociatedSection()); // qq
 
     uint64_t SecEnd = getStream().tell();
     SectionOffsets[RelSection] = std::make_pair(SecStart, SecEnd);

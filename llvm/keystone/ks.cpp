@@ -17,8 +17,8 @@
 #define LLVM_ENABLE_ARCH_EVM
 #include "EVMMapping.h"
 
-// DEBUG
-//#include <iostream>
+
+#include <iostream>
 
 #include "ks_priv.h"
 
@@ -565,10 +565,141 @@ void ks_free(unsigned char *p)
     free(p);
 }
 
+KEYSTONE_EXPORT
+void ks_free_new(ks_instruction (*ks_instructions)[0], size_t num_of_instructions)
+{
+    for(int i = 0; i < num_of_instructions; ++i){
+    	free((*ks_instructions)[i].instruction);
+    }
+    free(ks_instructions);
+}
 /*
  @return: 0 on success, or -1 on failure.
  On failure, call ks_errno() for error code.
 */
+
+KEYSTONE_EXPORT
+int ks_asm_new(ks_engine *ks,
+        const char *assembly,
+        uint64_t address,
+        size_t *stat_count, ks_instruction (**ks_instructions)[0]) //Just a hack to allow passing pointer to array by just having a fake size as 0
+{
+    MCCodeEmitter *CE;
+    MCStreamer *Streamer;
+    unsigned char *encoding;
+    SmallString<1024> Msg;
+    raw_svector_ostream OS(Msg);
+
+    if (ks->arch == KS_ARCH_EVM) {
+        // handle EVM differently
+        unsigned short opcode = EVM_opcode(assembly);
+        if (opcode == (unsigned short)-1) {
+            // invalid instruction
+            return -1;
+        }
+
+        // *insn_size = 1;
+        // *stat_count = 1;
+        // encoding = (unsigned char *)malloc(*insn_size);
+        // encoding[0] = opcode;
+        // *insn = encoding;
+        return 0;
+    }
+
+    MCContext Ctx(ks->MAI, ks->MRI, &ks->MOFI, &ks->SrcMgr, true, address);
+    ks->MOFI.InitMCObjectFileInfo(Triple(ks->TripleName), Ctx);
+    CE = ks->TheTarget->createMCCodeEmitter(*ks->MCII, *ks->MRI, Ctx);
+    if (!CE) {
+        // memory insufficient
+        return KS_ERR_NOMEM;
+    }
+    Streamer = ks->TheTarget->createMCObjectStreamer(
+            Triple(ks->TripleName), Ctx, *ks->MAB, OS, CE, *ks->STI, ks->MCOptions.MCRelaxAll,
+            /*DWARFMustBeAtTheEnd*/ false);
+            
+    if (!Streamer) {
+        // memory insufficient
+        delete CE;
+        return KS_ERR_NOMEM;
+    }
+
+    // Tell SrcMgr about this buffer, which is what the parser will pick up.
+    ErrorOr<std::unique_ptr<MemoryBuffer>> BufferPtr = MemoryBuffer::getMemBuffer(assembly);
+    if (BufferPtr.getError()) {
+        delete Streamer;
+        delete CE;
+        return KS_ERR_NOMEM;
+    }
+
+    ks->SrcMgr.clearBuffers();
+    ks->SrcMgr.AddNewSourceBuffer(std::move(*BufferPtr), SMLoc());
+
+    Streamer->setSymResolver((void *)(ks->sym_resolver));
+
+    MCAsmParser *Parser = createMCAsmParser(ks->SrcMgr, Ctx, *Streamer, *ks->MAI);
+    if (!Parser) {
+        delete Streamer;
+        delete CE;
+        // memory insufficient
+        return KS_ERR_NOMEM;
+    }
+    MCTargetAsmParser *TAP = ks->TheTarget->createMCAsmParser(*ks->STI, *Parser, *ks->MCII, ks->MCOptions);
+    if (!TAP) { 
+        // memory insufficient
+        delete Parser;
+        delete Streamer;
+        delete CE;
+        return KS_ERR_NOMEM;
+    }
+    TAP->KsSyntax = ks->syntax;
+
+    Parser->setTargetParser(*TAP);
+    ks->MAI->setCommentString(";");
+    // TODO: optimize this to avoid setting up NASM every time we call ks_asm()
+    if (ks->arch == KS_ARCH_X86 && ks->syntax == KS_OPT_SYNTAX_NASM) {
+        Parser->initializeDirectiveKindMap(KS_OPT_SYNTAX_NASM);
+    }
+
+    *stat_count = Parser->Run(false, address, (ks->arch == KS_ARCH_PPC));
+
+    // PPC counts empty statement
+    // if (ks->arch == KS_ARCH_PPC)
+    //     *stat_count = *stat_count / 2;
+
+    ks->errnum = Parser->KsError;
+
+    delete TAP;
+    //delete Parser;
+    delete CE;
+    delete Streamer;
+
+    if (ks->errnum >= KS_ERR_ASM)
+        return -1;
+    else {
+        // my edit for individual instruction hack
+	    std::vector<int>size_of_instructions = Parser->get_instruction_sizes();
+
+	    delete Parser;
+
+	    //PPC adds a empty statement after every statement cuz god knows why
+	    //So remove it
+	    // if (ks->arch == KS_ARCH_PPC){
+	    // 	process_ppc(size_of_instructions);
+	    // 	*stat_count = size_of_instructions.size();
+	    // }
+
+	    *ks_instructions = (ks_instruction (*)[0])malloc(*stat_count * sizeof(ks_instruction));
+	    ks_instruction (*ks_instructions_dereferenced)[0] = *ks_instructions;
+	    size_t counter = 0;
+	    for(int i = 0; i < size_of_instructions.size();++i){
+	    	(*ks_instructions_dereferenced)[i].size = size_of_instructions[i];
+	    	(*ks_instructions_dereferenced)[i].instruction = (unsigned char *)malloc((*ks_instructions_dereferenced)[i].size);
+	    	memcpy((*ks_instructions_dereferenced)[i].instruction, Msg.substr(counter, (*ks_instructions_dereferenced)[i].size).data(), (*ks_instructions_dereferenced)[i].size);
+	    	counter += (*ks_instructions_dereferenced)[i].size;
+	    }
+	    return 0;
+    }
+}
 KEYSTONE_EXPORT
 int ks_asm(ks_engine *ks,
         const char *assembly,
