@@ -246,6 +246,10 @@ void MCObjectStreamer::EmitInstruction(MCInst &Inst,
                                        const MCSubtargetInfo &STI,
                                        unsigned int &KsError)
 {
+  //A very weird Aarch64 bug, just nulling KsError fixes it
+  KsError = 0;
+ //--------------------------------------
+  
   MCStreamer::EmitInstruction(Inst, STI, KsError);
 
   MCSection *Sec = getCurrentSectionOnly();
