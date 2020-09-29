@@ -329,10 +329,10 @@ int ks_asm(ks_engine *ks,
         unsigned char **insn, size_t *insn_size,
         size_t *stat_count);
 KEYSTONE_EXPORT
-int ks_asm_new(ks_engine *ks,
+int ks_asm_by_line(ks_engine *ks,
         const char *assembly,
         uint64_t address,
-        size_t *stat_count, ks_instruction (**ks_instructions)[0]);
+        size_t *stat_count, ks_instruction **ks_instructions);
 
 /*
  Free memory allocated by ks_asm()
@@ -343,7 +343,7 @@ KEYSTONE_EXPORT
 void ks_free(unsigned char *p);
 
 KEYSTONE_EXPORT
-void ks_free_new(ks_instruction (*ks_instructions)[0], size_t num_of_instructions);
+void ks_free_instructions(ks_instruction *ks_instructions, size_t num_of_instructions);
 
 
 #ifdef __cplusplus

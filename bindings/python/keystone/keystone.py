@@ -21,10 +21,6 @@ _lib_path = split(__file__)[0]
 _all_libs = ('keystone.dll', 'libkeystone.so', 'libkeystone.so.%u' %KS_API_MAJOR, 'libkeystone.dylib')
 _found = False
 
-class ks_instruction(Structure):
-    _fields_ = [("size", c_int), 
-                ("instruction", POINTER(c_ubyte))]
-
 for _lib in _all_libs:
     try:
         _lib_file = join(_lib_path, _lib)
@@ -87,6 +83,10 @@ def _setup_prototype(lib, fname, restype, *argtypes):
 kserr = c_int
 ks_engine = c_void_p
 ks_hook_h = c_size_t
+class ks_instruction(Structure):
+    _fields_ = [("size", c_int),
+                ("instruction", POINTER(c_ubyte))]
+
 
 _setup_prototype(_ks, "ks_version", c_uint, POINTER(c_int), POINTER(c_int))
 _setup_prototype(_ks, "ks_arch_supported", c_bool, c_int)
@@ -96,9 +96,9 @@ _setup_prototype(_ks, "ks_strerror", c_char_p, kserr)
 _setup_prototype(_ks, "ks_errno", kserr, ks_engine)
 _setup_prototype(_ks, "ks_option", kserr, ks_engine, c_int, c_void_p)
 _setup_prototype(_ks, "ks_asm", c_int, ks_engine, c_char_p, c_uint64, POINTER(POINTER(c_ubyte)), POINTER(c_size_t), POINTER(c_size_t))
-_setup_prototype(_ks, "ks_asm_new", c_int, ks_engine, c_char_p, c_uint64, POINTER(c_size_t), POINTER(POINTER(ks_instruction)))
+_setup_prototype(_ks, "ks_asm_by_line", c_int, ks_engine, c_char_p, c_uint64, POINTER(c_size_t), POINTER(POINTER(ks_instruction)))
 _setup_prototype(_ks, "ks_free", None, POINTER(c_ubyte))
-_setup_prototype(_ks, "ks_free_new", None, POINTER(ks_instruction), c_size_t)
+_setup_prototype(_ks, "ks_free_instructions", None, POINTER(ks_instruction), c_size_t)
 
 # callback for OPT_SYM_RESOLVER option
 KS_SYM_RESOLVER = CFUNCTYPE(c_bool, c_char_p, POINTER(c_uint64))
@@ -231,13 +231,13 @@ class Ks(object):
                 _ks.ks_free(encode)
                 return (encoding, stat_count.value)
 
-    def asm_new(self, string, addr=0, as_bytes=False):
+    def asm_by_line(self, string, addr=0, as_bytes=False):
         stat_count = c_size_t()
         instructions = POINTER(ks_instruction)()
         if not isinstance(string, bytes) and isinstance(string, str):
             string = string.encode('ascii')
 
-        status = _ks.ks_asm_new(self._ksh, string, addr, byref(stat_count), byref(instructions))
+        status = _ks.ks_asm_by_line(self._ksh, string, addr, byref(stat_count), byref(instructions))
         if (status != 0):
             errno = _ks.ks_errno(self._ksh)
             raise KsError(errno, stat_count.value)
@@ -249,7 +249,7 @@ class Ks(object):
                 for m in range(stat_count.value):
                     encoding.append(string_at(instructions[m].instruction, instructions[m].size))
 
-                _ks.ks_free_new(instructions, stat_count)
+                _ks.ks_free_instructions(instructions, stat_count)
                 return (encoding, stat_count.value)
 
 

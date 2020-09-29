@@ -566,12 +566,18 @@ void ks_free(unsigned char *p)
 }
 
 KEYSTONE_EXPORT
-void ks_free_new(ks_instruction (*ks_instructions)[0], size_t num_of_instructions)
+void ks_free_instructions(ks_instruction *ks_instructions, size_t num_of_instructions)
 {
-    for(int i = 0; i < num_of_instructions; ++i){
-    	free((*ks_instructions)[i].instruction);
+    if (ks_instructions != NULL) {
+        for (size_t i = 0; i < num_of_instructions; i++) {
+            unsigned char *instruction_data = ks_instructions[i].instruction;
+            if (instruction_data != NULL) {
+                free(instruction_data);
+                ks_instructions[i].instruction = NULL;
+            }
+        }
+        free(ks_instructions);
     }
-    free(ks_instructions);
 }
 /*
  @return: 0 on success, or -1 on failure.
@@ -579,10 +585,14 @@ void ks_free_new(ks_instruction (*ks_instructions)[0], size_t num_of_instruction
 */
 
 KEYSTONE_EXPORT
-int ks_asm_new(ks_engine *ks,
+int ks_asm_by_line(ks_engine *ks,
         const char *assembly,
         uint64_t address,
-        size_t *stat_count, ks_instruction (**ks_instructions)[0]) //Just a hack to allow passing pointer to array by just having a fake size as 0
+        size_t *stat_count,
+        ks_instruction **ks_instructions)
+// ks_instructions is a double pointer because
+// 1) it's just a pointer to memory we are allowed to write to, setting it to
+// 2) an array of ks_instruction
 {
     MCCodeEmitter *CE;
     MCStreamer *Streamer;
@@ -598,11 +608,14 @@ int ks_asm_new(ks_engine *ks,
             return -1;
         }
 
-        // *insn_size = 1;
-        // *stat_count = 1;
-        // encoding = (unsigned char *)malloc(*insn_size);
-        // encoding[0] = opcode;
-        // *insn = encoding;
+        /*
+        // This branch should not be reached, don't do any of this
+        *insn_size = 1;
+        *stat_count = 1;
+        encoding = (unsigned char *)malloc(*insn_size);
+        encoding[0] = opcode;
+        *insn = encoding;
+        */
         return 0;
     }
 
@@ -669,37 +682,42 @@ int ks_asm_new(ks_engine *ks,
     ks->errnum = Parser->KsError;
 
     delete TAP;
-    //delete Parser;
     delete CE;
     delete Streamer;
 
-    if (ks->errnum >= KS_ERR_ASM)
+    if (ks->errnum >= KS_ERR_ASM) {
+        delete Parser;
         return -1;
+    }
     else {
-        // my edit for individual instruction hack
-	    std::vector<int>size_of_instructions = Parser->get_instruction_sizes();
+        // edit for individual instructions
+	      std::vector<int> size_of_instructions = Parser->get_instruction_sizes();
 
-	    delete Parser;
+	      delete Parser;
 
-	    //PPC adds a empty statement after every statement cuz god knows why
-	    //So remove it
-	    // if (ks->arch == KS_ARCH_PPC){
-	    // 	process_ppc(size_of_instructions);
-	    // 	*stat_count = size_of_instructions.size();
-	    // }
+	      // PPC adds a empty statement after every statement cuz god knows why
+	      // So, remove it
+	      // if (ks->arch == KS_ARCH_PPC){
+	      // 	process_ppc(size_of_instructions);
+	      // 	*stat_count = size_of_instructions.size();
+	      // }
 
-	    *ks_instructions = (ks_instruction (*)[0])malloc(*stat_count * sizeof(ks_instruction));
-	    ks_instruction (*ks_instructions_dereferenced)[0] = *ks_instructions;
-	    size_t counter = 0;
-	    for(int i = 0; i < size_of_instructions.size();++i){
-	    	(*ks_instructions_dereferenced)[i].size = size_of_instructions[i];
-	    	(*ks_instructions_dereferenced)[i].instruction = (unsigned char *)malloc((*ks_instructions_dereferenced)[i].size);
-	    	memcpy((*ks_instructions_dereferenced)[i].instruction, Msg.substr(counter, (*ks_instructions_dereferenced)[i].size).data(), (*ks_instructions_dereferenced)[i].size);
-	    	counter += (*ks_instructions_dereferenced)[i].size;
-	    }
-	    return 0;
+        ks_instruction* instruction_arr = (ks_instruction *)malloc((*stat_count) * sizeof(ks_instruction));
+	      size_t counter = 0;
+	      for(size_t i = 0; i < size_of_instructions.size(); i++){
+	          int instruction_size = size_of_instructions[i];
+	          printf("%i: %i\n", i, instruction_size);
+	          ks_instruction this_instruction = instruction_arr[i];
+	    	    this_instruction.size = size_of_instructions[i];
+	    	    this_instruction.instruction = (unsigned char*)malloc(instruction_size * sizeof(unsigned char));
+	    	    memcpy(this_instruction.instruction, Msg.substr(counter, instruction_size).data(), instruction_size);
+	    	    counter += instruction_size;
+	      }
+	      *ks_instructions = instruction_arr;
+	      return 0;
     }
 }
+
 KEYSTONE_EXPORT
 int ks_asm(ks_engine *ks,
         const char *assembly,
