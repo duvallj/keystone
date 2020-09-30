@@ -704,13 +704,13 @@ int ks_asm_by_line(ks_engine *ks,
 
         ks_instruction* instruction_arr = (ks_instruction *)malloc((*stat_count) * sizeof(ks_instruction));
 	      size_t counter = 0;
+	      ks_instruction this_instruction;
 	      for(size_t i = 0; i < size_of_instructions.size(); i++){
 	          int instruction_size = size_of_instructions[i];
-	          printf("%i: %i\n", i, instruction_size);
-	          ks_instruction this_instruction = instruction_arr[i];
 	    	    this_instruction.size = size_of_instructions[i];
 	    	    this_instruction.instruction = (unsigned char*)malloc(instruction_size * sizeof(unsigned char));
 	    	    memcpy(this_instruction.instruction, Msg.substr(counter, instruction_size).data(), instruction_size);
+	    	    instruction_arr[i] = this_instruction;
 	    	    counter += instruction_size;
 	      }
 	      *ks_instructions = instruction_arr;
