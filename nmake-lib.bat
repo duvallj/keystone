@@ -34,10 +34,10 @@ if "%allparams:~-1%"==" " set "allparams=%allparams:~0,-1%" & goto intercept_rig
 :eof
 
 if "%allparams%"=="" (
-cmake "%flags%" -DLLVM_TARGETS_TO_BUILD="all" -G "NMake Makefiles" ..
+cmake "%flags%" -DLLVM_TARGETS_TO_BUILD="all" -G "Ninja" ..
 ) else (
-cmake "%flags%" "-DLLVM_TARGETS_TO_BUILD=%allparams%" -G "NMake Makefiles" ..
+cmake "%flags%" "-DLLVM_TARGETS_TO_BUILD=%allparams%" -G "Ninja" ..
 )
 
-nmake
+ninja
 
